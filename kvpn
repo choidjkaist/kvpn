@@ -1,0 +1,735 @@
+#!/usr/bin/env python3
+"""kvpn — headless connect to the KAIST VPN (Ivanti Connect Secure + AirCUVE 2Auth).
+
+Does the whole login in the terminal — id/password, SMS or Email code entry —
+then brings the tunnel up via openconnect. No browser required.
+
+Flow (reverse-engineered from the live service):
+  1. GET  kvpn.kaist.ac.kr/            -> Ivanti sign-in session (DSSIGNIN)
+  2. GET  portal /view/redirectVPN     -> portal session (JSESSIONID) + correlation code
+  3. GET  portal /view/onepassCheck    -> (-> /vpnInit) set OTP context
+  4. POST portal /api/portal           -> send SMS/Email code
+  5. POST portal /j_spring_security_check.do -> verify code (-> OAuth)
+  6. GET  portal /vpn/<client_id>?code -> read `message` = the password#2 token
+  7. POST login.cgi (user+pass+realm+password#2) -> DSID
+  8. sudo openconnect --protocol=nc --cookie-on-stdin kvpn.kaist.ac.kr
+
+Credentials can optionally be stored (password in the macOS Keychain, id/realm
+in ~/.config/kvpn/config.json); `kvpn --forget` removes them again.
+
+Requires: python3 (stdlib only) and openconnect on PATH.
+"""
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from kvpn_ui import title, row, note, color, command_help
+import argparse
+from kvpn_sms import SMSReader, SMSError
+from kvpn_runtime import Manager, RuntimeError as LifecycleError, VERSION, display_status, redact
+import os
+import re
+import ssl
+import json
+import time
+import getpass
+import shutil
+import subprocess
+import http.cookiejar
+from html.parser import HTMLParser
+import urllib.request
+import urllib.parse
+
+# ---- deployment constants (from ags_frame.js / captured traffic) ----
+IVANTI = "https://kvpn.kaist.ac.kr"
+PORTAL = "https://kvpnportal.kaist.ac.kr:8443"
+CLIENT_ID = "rmwb8juiS8oJ5XVK"
+APP_NAME = "vpn2auth"
+REALMS = ["KAIST Members", "Visitors", "Graduates"]
+UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+
+
+class KvpnError(Exception):
+    """A user-facing failure with a clear message."""
+
+
+class ExistingSessionError(KvpnError):
+    """Gateway requires explicit confirmation before replacing a session."""
+
+
+# --------------------------------------------------------------------------
+# HTTP plumbing
+# --------------------------------------------------------------------------
+def new_session():
+    """Return (opener, cookiejar) with its own cookie store."""
+    cj = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPCookieProcessor(cj),
+        urllib.request.HTTPSHandler(context=ssl.create_default_context()),
+    )
+    opener.addheaders = [("User-Agent", UA)]
+    return opener, cj
+
+
+def http_get(opener, url, referer=None):
+    req = urllib.request.Request(url)
+    if referer:
+        req.add_header("Referer", referer)
+    with opener.open(req, timeout=30) as r:
+        return r.geturl(), r.read().decode("utf-8", "replace")
+
+
+def http_post(opener, url, data, referer=None):
+    body = urllib.parse.urlencode(data).encode()
+    req = urllib.request.Request(url, data=body)
+    req.add_header("Content-Type", "application/x-www-form-urlencoded")
+    if referer:
+        req.add_header("Referer", referer)
+    with opener.open(req, timeout=30) as r:
+        return r.geturl(), r.read().decode("utf-8", "replace")
+
+
+def cookie_value(cj, name):
+    for c in cj:
+        if c.name == name:
+            return c.value
+    return None
+
+
+class _NoAutoRedirect(urllib.request.HTTPErrorProcessor):
+    """Return 3xx/4xx responses instead of raising or auto-following them,
+    so a redirect chain can be walked by hand (cookies still update)."""
+    def http_response(self, request, response):
+        return response
+    https_response = http_response
+
+
+# --------------------------------------------------------------------------
+# Ivanti side
+# --------------------------------------------------------------------------
+class _GatewayForms(HTMLParser):
+    """Read form controls without evaluating gateway JavaScript."""
+    def __init__(self):
+        super().__init__()
+        self.forms = []
+        self.current = None
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if tag == 'form':
+            self.current = {'action': attrs.get('action', ''),
+                            'method': attrs.get('method', 'get').lower(),
+                            'hidden': {}, 'submit': {}}
+            self.forms.append(self.current)
+        elif tag == 'input' and self.current is not None and 'disabled' not in attrs:
+            kind = attrs.get('type', '').lower()
+            name = attrs.get('name')
+            if name and kind in ('hidden', 'submit'):
+                self.current[kind][name] = attrs.get('value', '')
+
+    def handle_endtag(self, tag):
+        if tag == 'form':
+            self.current = None
+
+
+class Ivanti:
+    def __init__(self):
+        self.opener, self.cj = new_session()
+        self.welcome_url = None
+        self.login_url = None
+
+    def begin(self):
+        """Step 1: land on the sign-in page, capture the login endpoint."""
+        url, html = http_get(self.opener, IVANTI + "/")
+        forms = _GatewayForms()
+        forms.feed(html)
+        notices = [f for f in forms.forms if 'sn-preauth-proceed' in f['submit']]
+        if notices:
+            if len(notices) != 1:
+                raise KvpnError("Ambiguous Ivanti pre-sign-in notification; stopped before login.")
+            form = notices[0]
+            action = urllib.parse.urljoin(url, form['action'])
+            target = urllib.parse.urlsplit(action)
+            origin = urllib.parse.urlsplit(IVANTI)
+            if (form['method'] != 'post' or target.scheme != origin.scheme
+                    or target.netloc != origin.netloc
+                    or not re.fullmatch(r'/dana-na/auth/(?:url_[^/]+/)?welcome\.cgi', target.path)):
+                raise KvpnError("Unexpected Ivanti notification destination; stopped before login.")
+            row('Gateway', 'Continuing past pre-sign-in notification')
+            data = dict(form['hidden'])
+            data['sn-preauth-proceed'] = form['submit']['sn-preauth-proceed']
+            url, html = http_post(self.opener, action, data, referer=url)
+            # One acknowledgement only: never loop through notices or request OTPs here.
+            if urllib.parse.urlsplit(url).netloc != origin.netloc or urllib.parse.urlsplit(url).scheme != origin.scheme:
+                raise KvpnError("Unexpected redirect after Ivanti notification; stopped before login.")
+        self.welcome_url = url
+        m = re.search(r'action=["\']([^"\']*login\.cgi)["\']', html, re.I)
+        if not m:
+            m = re.search(r'(/dana-na/auth/url_[^/"\']+/login\.cgi)', html)
+        if not m:
+            raise KvpnError("Ivanti did not return a login form" +
+                            (" after the pre-sign-in notification." if notices else ".") +
+                            " The gateway may be showing a notice, maintenance or an unsupported page; no SMS requested.")
+        self.login_url = urllib.parse.urljoin(url, m.group(1))
+        if urllib.parse.urlsplit(self.login_url)[:2] != urllib.parse.urlsplit(IVANTI)[:2]:
+            raise KvpnError("Unexpected Ivanti login destination; stopped before login.")
+        return self.welcome_url
+
+    def finish(self, username, password, realm, password2, unattended=False, replace_existing=False):
+        """Step 7: submit primary + secondary credentials, return the DSID."""
+        final_url, body = http_post(self.opener, self.login_url, {
+            "tz_offset": "540",
+            "username": username,
+            "password": password,
+            "realm": realm,
+            "password#2": password2,
+        }, referer=self.welcome_url)
+        if "p=failed" in final_url or "p=locked" in final_url:
+            raise KvpnError("Ivanti rejected the final login (bad password, or the "
+                            "sign-in session expired while entering the code).")
+        if "p=user-confirm" in final_url or 'name="frmConfirmation"' in body:
+            # Active-session confirmation page: the account already has a live
+            # session, and the gateway wants a "Continue" click before issuing
+            # a DSID. Submit the confirmation form like the browser would.
+            if not replace_existing and (unattended or not sys.stdin.isatty() or input(
+                "Another session is active. Continuing may replace it. Continue? [y/N]: "
+            ).strip().lower() not in ("y", "yes")):
+                raise ExistingSessionError("Existing session retained; login cancelled.\n"
+                                           "The gateway reports another active session. Run `kvpn on` "
+                                           "and confirm replacement if it is your previous connection.")
+            if replace_existing:
+                row("Session", "Replacing previous gateway session", "33")
+            final_url, body = self._confirm_continue(final_url, body)
+            if "p=user-confirm" in final_url or 'name="frmConfirmation"' in body:
+                raise ExistingSessionError("Gateway did not accept session replacement; stopped without retrying SMS.")
+        dsid = cookie_value(self.cj, "DSID")
+        if not dsid:
+            raise KvpnError("Login did not yield a DSID cookie (unexpected server response "
+                            "at %s)." % final_url)
+        self.final_url, self.final_body = final_url, body
+        return dsid
+
+    def _confirm_continue(self, page_url, body):
+        """Submit the frmConfirmation page (btnContinue + hidden fields)."""
+        data = {}
+        btn = None
+        for tag in re.findall(r"<input\b[^>]*>", body, re.I):
+            name = re.search(r'name=["\']([^"\']+)["\']', tag, re.I)
+            value = re.search(r'value=["\']([^"\']*)["\']', tag, re.I)
+            typ = re.search(r'type=["\']([^"\']+)["\']', tag, re.I)
+            if not name:
+                continue
+            typ = typ.group(1).lower() if typ else "text"
+            if typ == "hidden":
+                data[name.group(1)] = value.group(1) if value else ""
+            elif typ == "submit" and name.group(1).lower() == "btncontinue":
+                btn = (name.group(1), value.group(1) if value else "Continue")
+        if btn is None:
+            btn = ("btnContinue", "Continue the session")
+        data[btn[0]] = btn[1]
+        if os.environ.get("KVPN_DEBUG"):
+            print("  [confirm] posting %s to login.cgi" % sorted(data))
+        return http_post(self.opener, self.login_url, data, referer=page_url)
+
+
+# --------------------------------------------------------------------------
+# AirCUVE 2Auth portal side
+# --------------------------------------------------------------------------
+class Portal:
+    def __init__(self, parent_url):
+        self.opener, self.cj = new_session()
+        # second opener over the SAME jar that does not auto-follow redirects
+        self.raw = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(self.cj),
+            urllib.request.HTTPSHandler(context=ssl.create_default_context()),
+            _NoAutoRedirect,
+        )
+        self.raw.addheaders = [("User-Agent", UA)]
+        self.parent = parent_url
+
+    def _raw(self, method, url, data=None, referer=None):
+        """Single request, no redirect following. Returns (status, headers, body)."""
+        body = urllib.parse.urlencode(data).encode() if data is not None else None
+        req = urllib.request.Request(url, data=body, method=method)
+        req.add_header("Sec-Fetch-Dest", "iframe")
+        req.add_header("Sec-Fetch-Mode", "navigate")
+        req.add_header("Sec-Fetch-Site", "same-origin")
+        if data is not None:
+            req.add_header("Content-Type", "application/x-www-form-urlencoded")
+        if referer:
+            req.add_header("Referer", referer)
+        with self.raw.open(req, timeout=30) as r:
+            return r.getcode(), r.headers, r.read().decode("utf-8", "replace")
+
+    def begin(self, username):
+        """Steps 2-3: mint the portal session and set the OTP context."""
+        rv = PORTAL + "/view/redirectVPN?" + urllib.parse.urlencode({
+            "user_name": username,
+            "time": int(time.time() * 1000),
+            "parent": self.parent,
+            "client_id": CLIENT_ID,
+            "app_name": APP_NAME,
+        })
+        _, html = http_get(self.opener, rv, referer=self.parent)
+        m = re.search(r'name=["\']code["\'][^>]*value=[\'"]([^\'"]+)[\'"]', html)
+        if not m:
+            raise KvpnError("Portal did not return a correlation code (is the username "
+                            "registered for 2Auth?).")
+        code = m.group(1)
+        # onepassCheck -> vpnInit: primes the OTP context for this session
+        oc = PORTAL + "/view/onepassCheck?" + urllib.parse.urlencode({
+            "user_name": username, "code": code, "parent": self.parent,
+        })
+        http_get(self.opener, oc, referer=rv)
+        # GET /oauth/authorize (bounces to /request). This registers the OAuth
+        # request as Spring Security's "saved request", so after the OTP login
+        # the portal redirects back into the OAuth flow instead of to "/".
+        authorize = PORTAL + "/oauth/authorize?" + urllib.parse.urlencode({
+            "client_id": CLIENT_ID,
+            "redirect_uri": PORTAL + "/vpn/" + CLIENT_ID,
+            "response_type": "code",
+            "scope": "qr",
+            "app_name": APP_NAME,
+            "user_name": username,
+            "parent": self.parent,
+        })
+        http_get(self.opener, authorize, referer=oc)
+
+    def send_code(self, username, send_type):
+        """Step 4: trigger an SMS or Email one-time code."""
+        http_post(self.opener, PORTAL + "/api/portal", {
+            "cmd": "AuthPortal.twoAuthSend",
+            "send_type": send_type,          # "sms" or "email"
+            "user_name": username,
+        }, referer=self.parent)
+
+    def verify(self, username, otp):
+        """Steps 5-6: verify the code, walk the OAuth chain by hand, return password#2."""
+        debug = os.environ.get("KVPN_DEBUG")
+        mainmenu = PORTAL + "/view/mainMenu"
+
+        status, hdrs, _ = self._raw("POST", PORTAL + "/j_spring_security_check.do", {
+            "j_username": username,
+            "j_password": otp,
+            "otp_flag": "1",
+        }, referer=mainmenu)
+        if debug:
+            print("  [verify] j_spring -> %s %s" % (status, redact(hdrs.get("Location", ""))[:90]))
+        if status not in (301, 302, 303, 307, 308):
+            raise KvpnError("Code verification failed (wrong or expired code).")
+
+        # follow the OAuth redirect chain manually to reach the token page
+        loc = urllib.parse.urljoin(PORTAL + "/", hdrs.get("Location"))
+        body = ""
+        for _ in range(6):
+            status, hdrs, body = self._raw("GET", loc, referer=mainmenu)
+            if debug:
+                print("  [verify] hop %s %-70s -> %s" % (status, redact(loc)[:70],
+                                                         redact(hdrs.get("Location", ""))[:60]))
+            if status in (301, 302, 303, 307, 308):
+                loc = urllib.parse.urljoin(loc, hdrs.get("Location"))
+                continue
+            break
+        if status != 200:
+            raise KvpnError("OAuth token page returned HTTP %s at %s" % (status, loc[:120]))
+
+        m = re.search(r'var\s+message\s*=\s*["\']([^"\']+)["\']', body)
+        if not m:
+            raise KvpnError("Verified OK, but the token (password#2) was not on the OAuth "
+                            "page. Re-run with KVPN_DEBUG=1 and share the hop list.")
+        return m.group(1)
+
+
+# --------------------------------------------------------------------------
+# credential storage (opt-in)
+# --------------------------------------------------------------------------
+# The KAIST ID and realm live in a 0600 config file; the password goes into
+# the macOS Keychain (service "kvpn"). Off macOS the password falls back into
+# the config file itself, still 0600, with a warning at save time.
+KEYCHAIN_SERVICE = "kvpn"
+
+
+def config_path():
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(base, "kvpn", "config.json")
+
+
+def keychain_available():
+    return sys.platform == "darwin" and shutil.which("security")
+
+
+def _sec_quote(s):
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def keychain_set(username, password):
+    # `security -i` reads the command from stdin, keeping the password out of
+    # the process list.
+    line = "add-generic-password -U -a %s -s %s -w %s\n" % (
+        _sec_quote(username), _sec_quote(KEYCHAIN_SERVICE), _sec_quote(password))
+    r = subprocess.run(["security", "-i"], input=line.encode(),
+                       stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    if r.returncode != 0:
+        raise KvpnError("Could not write to the Keychain: %s"
+                        % r.stderr.decode("utf-8", "replace").strip())
+
+
+def keychain_get(username):
+    r = subprocess.run(["security", "find-generic-password",
+                        "-a", username, "-s", KEYCHAIN_SERVICE, "-w"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        return None
+    return r.stdout.rstrip("\n")
+
+
+def keychain_delete(username):
+    r = subprocess.run(["security", "delete-generic-password",
+                        "-a", username, "-s", KEYCHAIN_SERVICE],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return r.returncode == 0
+
+
+def _read_config():
+    try:
+        with open(config_path()) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def _write_config(cfg):
+    path = config_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(cfg, f, indent=2)
+        f.write("\n")
+
+
+def save_credentials(username, password, realm):
+    """Persist credentials; returns a human description of where they went."""
+    cfg = _read_config()
+    cfg.update({"username": username, "realm": realm})
+    cfg.pop("password", None)
+    where = "config file %s" % config_path()
+    if keychain_available():
+        keychain_set(username, password)
+        where = "macOS Keychain (id/realm in %s)" % config_path()
+    else:
+        cfg["password"] = password
+    _write_config(cfg)
+    return where
+
+
+def load_credentials():
+    """Return (username, password, realm) if stored, else None."""
+    cfg = _read_config()
+    username = cfg.get("username")
+    if not username:
+        return None
+    password = cfg.get("password")
+    if password is None and keychain_available():
+        password = keychain_get(username)
+    if not password:
+        return None
+    realm = cfg.get("realm")
+    if realm not in REALMS:
+        realm = REALMS[0]
+    return username, password, realm
+
+
+def forget_credentials():
+    """Remove everything `save_credentials` wrote. Returns True if any existed."""
+    removed = False
+    username = _read_config().get("username")
+    if username and keychain_available() and keychain_delete(username):
+        print("Removed the Keychain entry for %s." % username)
+        removed = True
+    try:
+        os.remove(config_path())
+        print("Removed %s." % config_path())
+        removed = True
+    except OSError:
+        pass
+    return removed
+
+
+def offer_to_save(username, password, realm):
+    dest = "the macOS Keychain" if keychain_available() else config_path()
+    try:
+        ans = input("Store these credentials in %s for future logins? [y/N]: "
+                    % dest).strip().lower()
+    except EOFError:
+        return
+    if ans in ("y", "yes"):
+        if not keychain_available():
+            print("  Note: no Keychain here; the password is stored in a "
+                  "user-only (0600) file.")
+        where = save_credentials(username, password, realm)
+        print("Stored in the %s. Run `kvpn --forget` to remove." % where)
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+def choose(prompt, options, default_index=0):
+    print("\n  " + prompt)
+    for i, opt in enumerate(options):
+        marker = " (default)" if i == default_index else ""
+        print("    %d  %s%s" % (i + 1, opt, marker))
+    while True:
+        raw = input("  Choose [%d]: " % (default_index + 1)).strip()
+        if not raw:
+            return options[default_index]
+        if raw.isdigit() and 1 <= int(raw) <= len(options):
+            return options[int(raw) - 1]
+        print("  Please enter a number between 1 and %d." % len(options))
+
+
+def authenticate_and_connect(manager, args):
+    title()
+    stored = load_credentials()
+    if stored:
+        username, password, realm = stored
+        row('Account', username)
+        row('Realm', realm)
+        row('Credentials', 'Saved in Keychain')
+    else:
+        if getattr(args, "sms_auto", False):
+            raise KvpnError("Save VPN credentials with kvpn on before using SMS automation.")
+        default_user = os.environ.get("KVPN_USER", "")
+        username = input("KAIST ID%s: " % (" [%s]" % default_user if default_user else "")).strip() \
+            or default_user
+        if not username:
+            raise KvpnError("A KAIST ID is required.")
+        password = getpass.getpass("Password: ")
+        if not password:
+            raise KvpnError("A password is required.")
+        realm = choose("Realm:", REALMS, 0)
+
+    ivanti = Ivanti()
+    welcome = ivanti.begin()
+
+    portal = Portal(welcome)
+    portal.begin(username)
+
+    automatic = getattr(args, "sms_auto", False)
+    reader = SMSReader() if automatic else None
+    sender = args.sms_sender if automatic else None
+    baseline = reader.baseline() if automatic else None
+    send_type = "sms" if automatic else ("sms" if choose("Send code via:", ["SMS", "Email"], 0) == "SMS" else "email")
+    if getattr(args, "cancelled", lambda: False)():
+        raise KvpnError("Automatic login stopped before SMS request.")
+    portal.send_code(username, send_type)
+    row('Verification', 'Waiting for SMS…' if automatic else 'Code sent via ' + send_type.upper(), '33')
+
+    otp = reader.wait(sender, baseline, cancelled=getattr(args, "cancelled", lambda: False)) if automatic else input("  Verification code: ").strip()
+    if not otp:
+        raise KvpnError("A code is required.")
+
+    if getattr(args, "cancelled", lambda: False)():
+        raise KvpnError("Automatic login stopped before submission.")
+    password2 = portal.verify(username, otp)
+    try:
+        dsid = ivanti.finish(username, password, realm, password2, unattended=automatic,
+                             replace_existing=manager.session_replacement_allowed())
+        authenticated_at = time.time()
+    except ExistingSessionError:
+        raise
+    except KvpnError as e:
+        if stored:
+            raise KvpnError("%s\nIf your KAIST password changed, run `kvpn --forget` "
+                            "and log in again." % e)
+        raise
+    row('Sign-in', 'Verified', '32')
+
+    if not stored:
+        offer_to_save(username, password, realm)
+
+    try:
+        from kvpn_timing import observe
+        observe(ivanti.opener, authenticated_at)
+    except Exception:
+        print('Gateway session limit unavailable; status will retain an explicit estimate.')
+    if args.inspect_session:
+        from kvpn_session import probe
+        try:
+            probe(ivanti)
+            from kvpn_session_channel import start
+            start(dsid)
+            print('Read-only in-memory session channel available for 20 minutes.')
+        except Exception as error:
+            print('Session discovery unavailable:', type(error).__name__)
+    if getattr(args, "cancelled", lambda: False)():
+        raise KvpnError("Automatic login stopped before tunnel launch.")
+    rc = manager.launch(dsid, authenticated_at=authenticated_at, foreground=args.foreground, reconnect_timeout=args.reconnect_timeout, estimate_hours=args.estimate_hours, unattended=automatic, supervised=getattr(args, 'command', None) == 'auto')
+    if rc:
+        raise KvpnError("OpenConnect exited unsuccessfully.")
+    return rc
+
+
+class KVPNParser(argparse.ArgumentParser):
+    def error(self, message):
+        import difflib
+        match = re.search(r"invalid choice: '([^']*)'", message)
+        if match:
+            command = match.group(1)
+            message = f"Unknown command: {command}"
+            suggestion = difflib.get_close_matches(command, ['setup', 'connect', 'disconnect', 'auto', 'status', 'doctor', 'logs', 'config', 'help', 'on', 'off'], n=1, cutoff=0.6)
+            hint = f"Try: kvpn {suggestion[0]}" if suggestion else 'Use: kvpn | kvpn off | kvpn status'
+        else:
+            hint = 'Run kvpn --help for usage.'
+        self.exit(2, f"\n  {color(message, '31')}\n  {color(hint, '36')}\n\n")
+
+    def print_help(self, file=None):
+        file = sys.stdout if file is None else file
+        if self.advanced_help:
+            return super().print_help(file)
+        self._print_message(
+            "\n  " + color('KVPN', '1;36') + "  KAIST VPN\n\n"
+            + command_help() + "\n\n  " + color('More options: kvpn --help-all', '2') + "\n\n", file)
+
+
+
+def main(argv):
+    advanced = '--help-all' in argv
+    argv = ['--help' if arg == '--help-all' else arg for arg in argv]
+    parser = KVPNParser(description="KAIST VPN CLI: background connection and explicit lifecycle control.")
+    parser.advanced_help = advanced
+    parser.add_argument('command', nargs='?', choices=['help', 'setup', 'doctor', 'config', 'check', 'on', 'off', 'connect', 'status', 'disconnect', 'log', 'logs', 'forget', 'auto', 'auto-stop', 'sms-check'], default='auto', metavar='COMMAND', help='setup, connect, auto, disconnect, status, doctor, logs, config, help; legacy aliases retained')
+    parser.add_argument('action', nargs='?', choices=['start', 'stop', 'status'], help='auto subcommand')
+    parser.add_argument('--session-replacement', choices=['ask', 'allow'], help='With config: require confirmation or allow replacing another gateway session')
+    parser.add_argument('--sms-auto', action='store_true', help='Read a fresh KAIST code from local Messages; requires saved credentials')
+    parser.add_argument('--sms-sender', help='Exact verified KAIST SMS sender; otherwise discover from recent matching messages')
+    parser.add_argument('--version', action='version', version=VERSION)
+    parser.add_argument('--forget', action='store_true', help='Remove saved credentials')
+    parser.add_argument('--inspect-session', action='store_true', help='Read-only discovery of gateway session timing/extension UI after login')
+    parser.add_argument('--foreground', action='store_true', help='Keep VPN attached to this terminal')
+    parser.add_argument('--json', action='store_true', help='Machine-readable status')
+    parser.add_argument('--reconnect-timeout', type=int, default=300, metavar='SECONDS', help='Native transport retry window, 1–3600 seconds (default 300); not session renewal')
+    parser.add_argument('--estimate-hours', type=int, default=10, metavar='HOURS', help='Unverified session lifetime estimate, 1–24 hours (default 10)')
+    args = parser.parse_args(argv)
+    if args.action:
+        if args.command != 'auto':
+            parser.error('Only auto accepts start, stop or status.')
+        args.command = {'start': 'auto', 'stop': 'auto-stop', 'status': 'status'}[args.action]
+    if args.session_replacement is not None and args.command != 'config':
+        parser.error('--session-replacement requires the config command.')
+    if args.json and args.command not in ('status', 'check', 'doctor', 'config'):
+        parser.error('--json is supported by status, doctor, check and config.')
+    if args.command == 'help':
+        parser.print_help()
+        return
+    if args.command == 'on':
+        args.command = 'connect'  # Keep the legacy spelling as a compatibility alias.
+    if args.command == 'log':
+        args.command = 'logs'
+    if args.command == 'off':
+        args.command = 'disconnect'
+    if args.forget:
+        args.command = "forget"
+    if not 1 <= args.reconnect_timeout <= 3600 or not 1 <= args.estimate_hours <= 24:
+        parser.error('Retry window must be 1–3600 seconds and lifetime estimate 1–24 hours.')
+    if sys.platform != 'darwin' and (args.command in ('auto', 'sms-check') or args.sms_auto):
+        raise KvpnError('Automatic SMS verification requires macOS Messages. Use kvpn connect for experimental manual login on Linux.')
+    manager = Manager()
+    if args.command == 'setup':
+        from kvpn_setup import guide
+        guide(manager)
+        return
+    if args.command == 'config':
+        if args.session_replacement is not None:
+            manager.set_session_replacement(args.session_replacement == 'allow')
+        value = {'session_replacement': 'allow' if manager.session_replacement_allowed() else 'ask'}
+        if args.json:
+            print(json.dumps(value))
+        else:
+            row('Session policy', value['session_replacement'])
+            note('Allow can disconnect another device using the same KAIST account.' if value['session_replacement'] == 'allow' else 'Manual login asks; automatic login stops when another gateway session needs replacement.')
+        return
+    if args.command in ('check', 'doctor'):
+        from kvpn_check import check, display
+        results = check(manager)
+        print(json.dumps(results, indent=2)) if args.json else display(results)
+        if any(item['status'] == 'error' for item in results):
+            raise SystemExit(1)
+        return
+    if args.command == 'auto-stop':
+        from kvpn_auto import request_stop
+        request_stop(manager)
+        print('Automatic recovery stop requested; existing VPN retained.')
+        return
+    if args.command == 'disconnect':
+        from kvpn_auto import request_stop
+        request_stop(manager)
+    if args.command == 'sms-check':
+        reader = SMSReader()
+        reader.diagnostics()
+        sender = args.sms_sender or reader.discover_sender()
+        print('Messages access OK. Verified sender candidate:', sender)
+        print('No message body or code printed; no SMS requested.')
+        return
+    if args.command == 'auto':
+        from kvpn_auto import auto_status
+        if auto_status(manager).get('running'):
+            row('Auto recovery', 'Already running', '32')
+            note('Use kvpn status to check or kvpn off to stop.')
+            return
+        if not shutil.which('openconnect'):
+            raise KvpnError('OpenConnect not found. Install it before starting automatic recovery.')
+        args.sms_auto = True
+    if args.sms_auto and args.command in ('connect', 'auto'):
+        if args.foreground or args.inspect_session:
+            parser.error('SMS automation cannot be combined with foreground tunnel or session inspection.')
+        reader = SMSReader()
+        reader.baseline()
+        args.sms_sender = args.sms_sender or reader.discover_sender()
+        if not load_credentials():
+            raise KvpnError('Saved credentials are required. Run kvpn connect once to save your credentials.')
+    if args.command == 'auto':
+        if not sys.stdin.isatty():
+            raise KvpnError('Start kvpn in Terminal for initial administrator authorization.')
+        current = manager.status()
+        if current['unmanaged_pids']:
+            raise KvpnError('Unmanaged VPN detected; no automatic login attempted.')
+        subprocess.run(['sudo', '-v'], check=True)
+        from kvpn_auto import supervise
+        supervise(manager,args,authenticate_and_connect)
+        return
+    if args.command == 'status':
+        value = manager.status()
+        from kvpn_auto import auto_status
+        value['automatic_reconnect'] = auto_status(manager)
+        print(json.dumps(value, indent=2)) if args.json else display_status(value)
+        return
+    if args.command == 'logs':
+        print(manager.logs() or 'No managed connection log yet.')
+        return
+    with manager.lock():
+        if args.forget or args.command == 'forget':
+            if not forget_credentials():
+                print('No stored credentials found.')
+            return
+        if args.command == 'disconnect':
+            manager.disconnect()
+            return
+        manager.assert_idle()
+        if not shutil.which('openconnect'):
+            raise KvpnError('OpenConnect not found. Install it with brew install openconnect.')
+        if not sys.stdin.isatty():
+            raise KvpnError('Fresh login requires an interactive terminal and OTP. No automatic login was attempted.')
+        subprocess.run(['sudo', '-v'], check=True)
+        authenticate_and_connect(manager, args)
+
+
+if __name__ == "__main__":
+    try:
+        main(sys.argv[1:])
+    except (KvpnError, SMSError, LifecycleError, OSError, subprocess.SubprocessError) as e:
+        print("\n  " + color("Error: " + redact(str(e)), "31") + "\n", file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print("\n  " + color("Cancelled.", "33") + "\n", file=sys.stderr)
+        sys.exit(130)

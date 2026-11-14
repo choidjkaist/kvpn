@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.har
+*.log
+kvpn.pass
+kvpn.user
+
+.DS_Store
+dist/
+docs/local-development.md
+kvpn_diagnostics.py
