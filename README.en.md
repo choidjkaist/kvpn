@@ -1,3 +1,3 @@
-# KVPN
+# KVPN — Automatic KAIST VPN connection on macOS
 
-The canonical English documentation is [README.md](README.md). This file preserves existing documentation links.
+See the [installation and usage guide](README.md) to set up KVPN on your Mac.

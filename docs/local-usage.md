@@ -1,5 +1,7 @@
-# Compatibility entrypoint
+# Using KVPN
 
-Current usage is maintained in [README.md](../README.md). Architecture and storage are documented in [architecture.md](architecture.md). These replace earlier mixed local/upstream instructions.
+Start with the [Mac installation and setup guide](../README.md).
 
-Existing aliases, credential locations and session replacement preferences are preserved. Installation does not overwrite an existing source-based installation automatically.
+Once setup is complete, run `kvpn auto` and leave the terminal open. Run `kvpn status` to check the connection, or `kvpn disconnect` to stop it.
+
+For connection errors, updates, and removal, see [Troubleshooting](troubleshooting.md).

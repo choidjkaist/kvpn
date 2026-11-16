@@ -1,36 +1,66 @@
-# Architecture
+# How KVPN works
 
-The `kvpn` entrypoint remains next to its `kvpn_*.py` modules to preserve existing symlink installations. Python standard library only; OpenConnect is an external executable.
+KVPN handles KAIST authentication and starts OpenConnect to carry VPN traffic. In automatic mode, a foreground supervisor watches the managed OpenConnect process and signs in again if that process exits.
 
-| Component | Responsibility |
-|---|---|
-| `kvpn` | CLI dispatch, Ivanti/AirCUVE HTTPS authentication, opt-in credentials |
-| `kvpn_sms.py` | Read-only local Messages access, fresh sender-bound OTP matching |
-| `kvpn_auto.py` | Foreground supervisor, network waiting, retry budget, stop requests |
-| `kvpn_runtime.py` | Process identity, locks, detached tunnel, sanitized logs, policy |
-| `kvpn_check.py`, `kvpn_setup.py` | Non-authenticating local checks and first-use guidance |
-| `kvpn_timing.py`, `kvpn_session*.py` | Allowlisted session timing and optional read-only inspection |
-| `kvpn_ui.py` | Terminal presentation |
-| `scripts/` | Offline installation and deterministic release packaging |
+## Connection sequence
 
-## Authentication and recovery
+1. Establish an Ivanti sign-in session and open the AirCUVE authentication flow.
+2. Request SMS or email verification and submit the code.
+3. Exchange the authentication result for an Ivanti session cookie (DSID).
+4. Pass the cookie to OpenConnect through standard input using its NC protocol.
 
-The client obtains an Ivanti sign-in session, prepares the AirCUVE portal, requests SMS/email verification, submits the OTP, and exchanges the portal result for an Ivanti DSID. OpenConnect receives this cookie through standard input using the NC protocol. No cookie is put in process arguments.
+Manual mode asks for the code in the terminal. Automatic mode uses saved credentials and reads SMS forwarded to the Mac's Messages app.
 
-The automatic path uses saved account credentials and reads new incoming messages from `~/Library/Messages/chat.db` in SQLite read-only/query-only mode. It requires a new row ID, a request-time cutoff, an exact sender, authentication context, and one unambiguous six-digit code. Sender discovery considers up to 200 recent incoming messages within 30 days and requires KVPN-specific context. SMS delivery and the database schema depend on Apple's Messages implementation.
+## Selecting an SMS code
 
-The tunnel and supervisor have different lifetimes. The tunnel detaches; the supervisor stays attached to its terminal. Transport retries belong to OpenConnect. Only process exit triggers fresh authentication, after a 10-second delay and a gateway TCP availability check. The check proves TCP reachability only, not portal health. Authentication errors stop instead of repeatedly sending SMS. A three-attempt rolling-hour limit exists in supervisor memory; it is not persistent across restarts.
+KVPN opens `~/Library/Messages/chat.db` in SQLite read-only/query-only mode. A code must come from a new message row, meet the request-time cutoff, match the exact sender and KAIST authentication context, and contain one unambiguous six-digit code.
 
-Operation and supervisor locks serialize control. Before signaling a process, the runtime checks PID, start time, root UID and exact command. Unmanaged OpenConnect instances are never terminated. Disconnect during an ongoing authentication operation can report a busy lock; cancellation is requested first and the user can retry after the bounded operation returns.
+Sender discovery examines up to 200 recent incoming messages within 30 days. It requires KVPN-specific context. An explicit `--sms-sender` can supply an independently verified sender when discovery is ambiguous. Code delivery and database compatibility depend on Apple's Messages implementation.
+
+## Reconnection
+
+OpenConnect first retries the transport using the existing session. Its default reconnection window is 300 seconds, adjustable with `--reconnect-timeout`.
+
+After the managed OpenConnect process exits, the supervisor waits for gateway TCP availability, then waits 10 seconds before attempting a fresh login. That check establishes TCP reachability, not whether the login page is working. KVPN waits up to 120 seconds for a new SMS code. Authentication failures stop supervision.
+
+The supervisor permits at most three login attempts in a rolling hour. This counter is held in memory and resets when the supervisor restarts. Automatic reconnection does not extend a gateway session indefinitely.
+
+The tunnel runs in the background; the supervisor remains attached to its terminal. While running, it refreshes existing sudo authorization every 60 seconds. KVPN installs no login item and changes no power settings.
+
+## Process control
+
+Operation and supervisor locks prevent conflicting actions. Before signaling a tunnel process, the runtime checks its PID, start time, root UID, and exact command. It does not terminate unmanaged OpenConnect processes.
+
+If disconnect is requested during authentication, KVPN requests cancellation. The command may report a busy operation until the current authentication step returns; disconnect can then be retried.
+
+Connection status reports process and interface evidence. It does not prove that a particular internal host is reachable. Session expiry values are estimates, not authoritative server deadlines.
 
 ## Storage
 
-- macOS password: opt-in Keychain service `kvpn`.
-- ID/realm: `${XDG_CONFIG_HOME:-~/.config}/kvpn/config.json`.
-- Without Keychain: opting into credential storage keeps the password in that user-only plaintext file; do not describe this as encrypted storage.
-- Runtime: `~/Library/Application Support/kvpn/`, mode 0700; managed files mode 0600. Existing path retained for compatibility.
-- Session policy: runtime `preferences.json`, boolean `replace_existing_session`; absent/false means no unattended takeover.
-- Logs are sanitized before disk writes. The latest connection replaces the previous log. Passwords, OTPs and DSID are not deliberately persisted by runtime logging; Messages itself retains incoming SMS independently.
-- Optional `--inspect-session` keeps DSID in process memory behind an owner-only UNIX socket for up to 20 minutes. It is a diagnostic, not a renewal service.
+| Data | Location or behavior |
+|---|---|
+| KAIST password on macOS | Opt-in Keychain entry under service `kvpn` |
+| Account name and realm | `${XDG_CONFIG_HOME:-~/.config}/kvpn/config.json` |
+| Password without Keychain | The same configuration file, in plaintext after opt-in |
+| Runtime files | `~/Library/Application Support/kvpn/`; directory mode 0700, managed file mode 0600 |
+| Session replacement setting | Runtime `preferences.json`; `replace_existing_session` defaults to false |
+| Connection log | Redacted before writing; each connection replaces the previous log |
 
-No launch agent, GUI automation, clipboard dependency or power policy is installed. Linux manual connection remains experimental; the macOS lifecycle and Messages integration must not be advertised as portable without testing.
+The optional `--inspect-session` diagnostic keeps the DSID in process memory behind an owner-only UNIX socket for up to 20 minutes. It does not renew the session.
+
+## Source layout
+
+The Python entrypoint and modules live together. Runtime code uses the Python standard library; OpenConnect is a separate executable.
+
+| File | Purpose |
+|---|---|
+| `kvpn` | Commands, authentication, and credential storage |
+| `kvpn_sms.py` | Messages access and verification-code matching |
+| `kvpn_auto.py` | Supervision, network waiting, and retry limits |
+| `kvpn_runtime.py` | Managed processes, locks, logs, and session policy |
+| `kvpn_check.py`, `kvpn_setup.py` | Local checks and setup guidance |
+| `kvpn_timing.py`, `kvpn_session*.py` | Session timing and optional inspection |
+| `kvpn_ui.py` | Terminal output |
+| `scripts/` | Installation and release packaging |
+
+Automatic Messages verification is macOS-only. Manual Linux connections remain experimental and have not been live-validated for this release.

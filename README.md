@@ -1,60 +1,99 @@
-# KVPN
+# KVPN — Automatic KAIST VPN connection on macOS
 
-An unofficial KAIST VPN CLI, with automatic SMS verification and recovery on macOS. Version **0.4.0rc2** is a release candidate of the existing local implementation, not an official KAIST client.
+Connect to KAIST VPN from your Mac and reconnect when the connection drops. KVPN reads verification codes from SMS forwarded to macOS Messages, so you do not have to copy a new code into the terminal each time.
 
-## Platform scope
+After a one-time setup, start it with:
 
-macOS is the primary environment. Automatic verification reads SMS forwarded from an iPhone to local macOS Messages; it never uses clipboard or simulated keystrokes. Linux manual SMS/email login is experimental and has not undergone live gateway validation for this release. Windows/WSL is not supported.
+```sh
+kvpn auto
+```
 
-Requirements: Python 3.9+, OpenConnect and sudo authorization. On macOS with Homebrew installed:
+Keep that terminal open while you want automatic reconnection. To stop both reconnection and the VPN, run `kvpn disconnect` in another terminal tab.
+
+KVPN is an unofficial command-line tool built around OpenConnect. **Automatic SMS verification works on macOS and requires an iPhone forwarding SMS to the Mac.** Manual Linux connections are experimental; Windows and WSL are not supported. The current download, **0.4.0rc2**, is a prerelease.
+
+## Install on a Mac
+
+You need a KAIST VPN account, an iPhone that receives its verification texts, and permission to run administrator commands on your Mac.
+
+### 1. Install the dependencies
+
+With [Homebrew](https://brew.sh) installed:
 
 ```sh
 brew install python openconnect
+```
+
+KVPN requires Python 3.9 or later.
+
+### 2. Download KVPN
+
+Download both files into the same folder:
+
+- [kvpn-0.4.0rc2.tar.gz](https://github.com/choidjkaist/kvpn/releases/download/v0.4.0rc2/kvpn-0.4.0rc2.tar.gz)
+- [kvpn-0.4.0rc2.tar.gz.sha256](https://github.com/choidjkaist/kvpn/releases/download/v0.4.0rc2/kvpn-0.4.0rc2.tar.gz.sha256)
+
+If they are in Downloads, run:
+
+```sh
+cd ~/Downloads
 shasum -a 256 -c kvpn-0.4.0rc2.tar.gz.sha256
+```
+
+Continue only if the result is `kvpn-0.4.0rc2.tar.gz: OK`:
+
+```sh
 tar -xzf kvpn-0.4.0rc2.tar.gz
 cd kvpn-0.4.0rc2
 ./install.sh
+export PATH="$HOME/.local/bin:$PATH"
+kvpn --version
 ```
 
-The installer copies only bundled files into `~/.local/share/kvpn/releases/0.4.0rc2` and links `~/.local/bin/kvpn`. It never downloads upstream, pulls Git, changes credentials, starts VPN, or installs login items. Add `~/.local/bin` ahead of other kvpn locations in PATH if required. `which -a kvpn` diagnoses shadowed installations. Use `--prefix PATH --bin-dir PATH` for custom locations. Existing symlinks require `--replace` to switch; regular files and differing same-version payloads are never overwritten. Checksums detect changed bytes, not publisher identity.
+Run the installer as your normal user, without `sudo`. It installs KVPN under `~/.local/share/kvpn/releases/` and creates `~/.local/bin/kvpn`. It does not connect to the VPN.
 
-## First use
+The `export` command applies to the current terminal. To make it permanent in the default macOS shell, add that same line to `~/.zshrc`. If another KVPN installation is already present, see [updates and installation conflicts](docs/troubleshooting.md#updates-and-installation-conflicts).
 
-1. Run `kvpn setup` for local checks and guidance; it does not log in or request SMS.
-2. Run `kvpn connect`, authenticate with your own account and choose Keychain storage if using automation.
-3. Enable iPhone SMS forwarding and verify KVPN messages arrive on this Mac.
-4. Grant Full Disk Access to the actual terminal app, then fully quit and reopen it. Authorization does not transfer between terminal apps.
-5. After a normal KVPN SMS login, run `kvpn sms-check`. It checks local access and sender discovery without sending SMS. If discovery is ambiguous, pass an independently verified `--sms-sender`.
-6. Run `kvpn auto`, authorize sudo if needed and keep that terminal open. An already managed tunnel is preserved.
+## Set up automatic SMS verification
 
-Never distribute account configuration, Messages databases, runtime state or credentials to another user.
+1. **Forward SMS to your Mac.** Enable Text Message Forwarding for this Mac in your iPhone's Messages settings. Confirm that KAIST verification texts arrive in the Mac's Messages app.
+2. **Allow your terminal to read Messages.** In macOS System Settings → Privacy & Security → Full Disk Access, enable the terminal app you use for KVPN. Fully quit and reopen that app. This is a broad permission; [read what KVPN accesses](SECURITY.md#messages-access).
+3. **Connect once manually.** Run `kvpn connect`, enter your KAIST credentials, select your account realm, and choose SMS verification. Enter the code, then answer `y` when asked to save your credentials in macOS Keychain so reconnection can use them later.
+4. **Check SMS access.** After receiving a KAIST VPN text, run `kvpn sms-check`. This checks local Messages access and identifies the sender; it does not request another code.
+5. **Start automatic reconnection.** Run `kvpn auto`, enter your Mac password if administrator authorization is requested, and leave the terminal open. If KVPN already has a managed connection, it keeps it.
 
-## Commands
+Use `kvpn setup` for setup guidance or `kvpn doctor` to check local prerequisites. If you cannot use SMS forwarding or do not want to grant Messages access, use `kvpn connect` and enter the verification code yourself.
 
-| Command | Behavior |
+## Everyday use
+
+| What you want to do | Command |
 |---|---|
-| `kvpn`, `kvpn auto`, `kvpn auto start` | SMS verification and automatic recovery |
-| `kvpn connect` | One connection with manual OTP |
-| `kvpn connect --sms-auto` | One connection with automatic SMS, no supervision |
-| `kvpn auto stop` | Stop supervision; retain VPN |
-| `kvpn disconnect` | Stop supervision and managed VPN |
-| `kvpn status`, `kvpn auto status` | Connection and recovery evidence |
-| `kvpn doctor` | Local prerequisite checks, no login or network probe |
-| `kvpn logs` | Sanitized latest connection log |
-| `kvpn config` | Session replacement policy |
-| `kvpn forget` | Delete saved credentials, not the current tunnel |
-| `kvpn --help-all` | Advanced options |
+| Connect and reconnect automatically | `kvpn auto` |
+| Check the connection | `kvpn status` |
+| Stop the VPN and automatic reconnection | `kvpn disconnect` |
+| Stop reconnection but leave the VPN connected | `kvpn auto stop` |
+| Connect once and enter the code yourself | `kvpn connect` |
+| Connect once with automatic SMS verification | `kvpn connect --sms-auto` |
+| Check local setup | `kvpn doctor` |
+| Read the latest connection log | `kvpn logs` |
+| Remove saved credentials | `kvpn forget` |
 
-Legacy aliases remain: `on`, `off`, `check`, `log`, `auto-stop`, `--forget`. JSON output is available for status, doctor/check and config. Ordinary connect detaches the tunnel; its terminal can close after success. `connect --foreground` ends the VPN with Ctrl+C. In auto mode Ctrl+C stops supervision only; use disconnect to end both.
+**In auto mode, Ctrl+C stops reconnection but leaves the VPN connected.** Use `kvpn disconnect` to end both. A successful one-time connection runs in the background, so its terminal can close. `kvpn forget` removes saved credentials without ending an active connection.
 
-By default a manual login asks before replacing another device's gateway session; automatic login stops instead. To explicitly allow takeover: `kvpn config --session-replacement allow`. Restore the default with `kvpn config --session-replacement ask`. Existing preferences are preserved.
+## What happens when the connection drops?
 
-## Recovery limits
+OpenConnect first tries to recover the existing connection. If its process exits, KVPN waits for the gateway to become reachable and attempts a fresh login with a new SMS code. Authentication errors stop automatic reconnection, and attempts are limited to avoid repeated login requests.
 
-OpenConnect first retries the transport using the existing session (300 seconds by default, adjustable with `--reconnect-timeout`). After process exit the supervisor waits 10 seconds and performs fresh SMS authentication. This does not extend a session indefinitely. New message row/time, exact sender, KAIST authentication context and a unique six-digit code must match. SMS wait is 120 seconds; authentication failures stop supervision. At most three login attempts per hour are allowed within one supervisor run; restarting resets this in-memory counter.
+KVPN does not keep the Mac awake or start itself after a reboot. Sleep can interrupt the VPN, and a fresh connection may interrupt an existing SSH session.
 
-The foreground supervisor refreshes existing sudo authorization every 60 seconds. It stores no Mac password and installs no NOPASSWD rule. It does not run at login or survive reboot automatically. Sleep can interrupt networking; fresh login can interrupt SSH. Process/interface status is not a destination reachability test. Expiry is estimated, not an absolute server expiry.
+If the same account is connected on another device, automatic login stops rather than replacing that session. See [using more than one device](docs/troubleshooting.md#using-more-than-one-device) if you want to change this behavior.
 
-See [architecture](docs/architecture.md), [troubleshooting](docs/troubleshooting.md), [security](SECURITY.md), and [changes](CHANGELOG.md). From the development checkout, run `python3 -m unittest discover -s tests -v` and `python3 scripts/build_release.py --output PATH`. Automated tests use synthetic credentials and fake privileged/network boundaries, not real authentication. The runtime bundle intentionally excludes development experiments, test fixtures, Git metadata and personal runtime/configuration files.
+## More information
 
-Based on [predict-woo/kaist-openconnect](https://github.com/predict-woo/kaist-openconnect), upstream revision `e52efaea3de7`. Do not update this modified distribution with the upstream installer. OpenConnect handles the actual tunnel. Not affiliated with KAIST, Ivanti or AirCUVE. Use your own account under your institution's terms. Original MIT license and copyright are retained.
+- [Troubleshooting, updates, and removal](docs/troubleshooting.md)
+- [Security and credential storage](SECURITY.md)
+- [How authentication and recovery work](docs/architecture.md)
+- [Development and testing](https://github.com/choidjkaist/kvpn/blob/main/docs/development.md)
+- [Release history](CHANGELOG.md)
+
+Based on [predict-woo/kaist-openconnect](https://github.com/predict-woo/kaist-openconnect), under the [MIT license](LICENSE). KVPN is not affiliated with KAIST, Ivanti, or AirCUVE.

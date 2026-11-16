@@ -1,13 +1,31 @@
 # Security and privacy
 
-KVPN uses the user's normal KAIST password and a fresh SMS/email verification code; it does not bypass multifactor authentication. Treat the Mac account, Keychain, terminal Full Disk Access and local Messages database as sensitive.
+KVPN signs in with your KAIST account and a fresh SMS or email verification code. It does not bypass multifactor authentication. OpenConnect runs with administrator privileges to create the VPN tunnel.
 
-Full Disk Access is a broad macOS permission, not permission limited to KAIST messages. KVPN queries incoming message metadata/text to identify verification codes; it does not upload the message database. Only the selected OTP is submitted to the KAIST authentication flow. No clipboard or simulated keystrokes are used.
+## Messages access
 
-Passwords stored without macOS Keychain are plaintext in a user-only file after explicit opt-in. Runtime logs are redacted, and session cookies are passed through stdin rather than argv. No NOPASSWD policy is installed. Automatic recovery refreshes an existing terminal sudo authorization while running.
+Automatic SMS verification reads the local Messages database on your Mac. The terminal running KVPN needs Full Disk Access, which grants broader access than just KAIST messages.
 
-Session replacement defaults to confirmation in manual mode and refusal in automatic mode. An explicit allow policy can disconnect another device using the same account. Never transfer that personal decision, saved credentials or runtime files in a distribution bundle.
+KVPN opens the database read-only and looks for a new verification text from the expected sender. It submits the selected code to the KAIST authentication service. It does not upload the Messages database or use the clipboard or simulated keystrokes. Messages itself retains incoming texts independently of KVPN.
 
-The release archive is built from an explicit file allowlist and ships no personal config, Messages database, runtime state, logs or Git history. SHA-256 checksums detect corruption; they are not a signed release identity. There is no auto-updater or remote install script execution.
+If you prefer not to grant this permission, use `kvpn connect` and enter the code manually.
 
-Do not post passwords, OTPs, cookies, raw HTTP captures, message databases or unreviewed logs in public issues. No dedicated security reporting address has been established for this local release candidate; arrange a private channel with the distributor before sharing security details.
+## Saved credentials and sessions
+
+When you choose to save credentials on macOS, KVPN uses Keychain for the password and a local configuration file for the account name and realm. Without Keychain, opting to save credentials stores the password as plaintext in a file readable only by your user. Use `kvpn forget` to remove saved credentials; this does not disconnect an active VPN.
+
+Session cookies are passed to OpenConnect through standard input, not command-line arguments. Logs are redacted before being written, but account names and network addresses may still identify you. Review logs before sharing them.
+
+Automatic reconnection periodically refreshes an existing administrator authorization while it runs. It stores no Mac password and installs no passwordless sudo rule.
+
+By default, a manual login asks before replacing another device's session, and an automatic login refuses to replace it. Setting `kvpn config --session-replacement allow` permits replacement and may disconnect the other device.
+
+## Downloads and installation
+
+The release archive contains an explicit list of application files. It excludes personal configuration, credentials, Messages data, runtime logs, and Git history. The installer uses the downloaded files without fetching additional code. There is no automatic updater.
+
+The SHA-256 file checks that the archive matches the published checksum. It is not a digital signature and does not independently authenticate the publisher.
+
+## Reporting a security issue
+
+Do not post passwords, verification codes, session cookies, Messages databases, or raw HTTP captures in public issues. If you find a vulnerability, arrange a private reporting channel with the maintainer before sending sensitive details. The project does not currently list a dedicated security contact.
